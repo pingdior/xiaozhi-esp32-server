@@ -262,7 +262,9 @@ class ASRProvider(ASRProviderBase):
             self._is_stopping = False
             # 重置所有音频相关状态
             conn.reset_audio_states()
-            # 本轮结束，后台预连下一轮，让下次开口不再等握手
+            # 本轮结束，后台预连下一轮，让下次开口不再等握手；
+            # 短时间内连续结束（如服务端立即断开）时按退避节流，避免连接风暴
+            self._warm_retry_at = time.monotonic() + ASR_WARM_RETRY_BACKOFF
             self._start_warm_session(conn)
 
     def stop_ws_connection(self):
