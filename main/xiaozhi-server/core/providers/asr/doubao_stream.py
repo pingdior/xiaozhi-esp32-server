@@ -1,5 +1,6 @@
 import json
 import gzip
+import time
 import uuid
 import asyncio
 import websockets
@@ -14,6 +15,11 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
+# 握手（建连 + 初始化响应）超时：火山偶发 rpc timeout，超时即退避重试
+ASR_HANDSHAKE_TIMEOUT = 10
+# 预连失败后的退避秒数，避免每帧音频都触发一次重连
+ASR_WARM_RETRY_BACKOFF = 2.0
+
 
 class ASRProvider(ASRProviderBase):
     def __init__(self, config, delete_audio_file):
@@ -25,6 +31,9 @@ class ASRProvider(ASRProviderBase):
         self.forward_task = None
         self.is_processing = False  # 添加处理状态标志
         self._is_stopping = False  # 添加停止标志，防止竞态条件
+        self._warm_task = None  # 后台预连任务
+        self._warm_retry_at = 0.0  # 预连失败后的退避截止时间（monotonic）
+        self._closed = False
 
         # 配置参数
         self.appid = str(config.get("appid"))
@@ -65,96 +74,93 @@ class ASRProvider(ASRProviderBase):
 
     async def open_audio_channels(self, conn):
         await super().open_audio_channels(conn)
+        # 连接建立即后台预连 ASR，握手不占用用户开口后的时间
+        self._start_warm_session(conn)
 
-    async def receive_audio(self, conn: "ConnectionHandler", pcm_frame, audio_have_voice):
-        # 先调用父类方法处理基础逻辑
-        await super().receive_audio(conn, pcm_frame, audio_have_voice)
+    def _start_warm_session(self, conn: "ConnectionHandler"):
+        """后台预连一个 ASR 会话并待命（握手完成后不发送音频，等检测到语音再开始）。"""
+        if self._closed or self.asr_ws is not None or self._warm_task is not None:
+            return
+        if time.monotonic() < self._warm_retry_at:
+            return
+        self._warm_task = asyncio.get_running_loop().create_task(self._open_session(conn))
 
-        # 如果本次有声音，且之前没有建立连接
-        if audio_have_voice and self.asr_ws is None and not self.is_processing:
-            try:
-                self.is_processing = True
-                # 建立新的WebSocket连接
-                headers = self.token_auth() if self.auth_method == "token" else None
-                logger.bind(tag=TAG).info(f"正在连接ASR服务，headers: {headers}")
-
-                self.asr_ws = await websockets.connect(
+    async def _open_session(self, conn: "ConnectionHandler"):
+        try:
+            # 注意：不打印请求头，其中包含 Access-Key
+            logger.bind(tag=TAG).info("正在连接ASR服务")
+            self.asr_ws = await asyncio.wait_for(
+                websockets.connect(
                     self.ws_url,
-                    additional_headers=headers,
+                    additional_headers=self.token_auth() if self.auth_method == "token" else None,
                     max_size=1000000000,
                     ping_interval=None,
                     ping_timeout=None,
                     close_timeout=10,
-                )
+                ),
+                timeout=ASR_HANDSHAKE_TIMEOUT,
+            )
 
-                # 发送初始化请求
-                request_params = self.construct_request(str(uuid.uuid4()))
-                try:
-                    payload_bytes = str.encode(json.dumps(request_params))
-                    payload_bytes = gzip.compress(payload_bytes)
-                    full_client_request = self.generate_header()
-                    full_client_request.extend((len(payload_bytes)).to_bytes(4, "big"))
-                    full_client_request.extend(payload_bytes)
+            request_params = self.construct_request(str(uuid.uuid4()))
+            payload_bytes = gzip.compress(str.encode(json.dumps(request_params)))
+            full_client_request = self.generate_header()
+            full_client_request.extend((len(payload_bytes)).to_bytes(4, "big"))
+            full_client_request.extend(payload_bytes)
+            await self.asr_ws.send(full_client_request)
 
-                    logger.bind(tag=TAG).info(f"发送初始化请求: {request_params}")
-                    await self.asr_ws.send(full_client_request)
+            init_res = await asyncio.wait_for(self.asr_ws.recv(), timeout=ASR_HANDSHAKE_TIMEOUT)
+            result = self.parse_response(init_res)
+            if "code" in result and result["code"] != 1000:
+                raise Exception(f"ASR服务初始化失败: {result.get('payload_msg', {}).get('error', '未知错误')}")
 
-                    # 等待初始化响应
-                    init_res = await self.asr_ws.recv()
-                    result = self.parse_response(init_res)
-                    logger.bind(tag=TAG).info(f"收到初始化响应: {result}")
+            self.forward_task = asyncio.create_task(self._forward_asr_results(conn))
+            logger.bind(tag=TAG).info("ASR会话已就绪，待命")
+        except Exception as e:
+            logger.bind(tag=TAG).error(f"建立ASR连接失败: {str(e)}")
+            if self.asr_ws:
+                await self.asr_ws.close()
+                self.asr_ws = None
+            self._warm_retry_at = time.monotonic() + ASR_WARM_RETRY_BACKOFF
+        finally:
+            self._warm_task = None
 
-                    # 检查初始化响应
-                    if "code" in result and result["code"] != 1000:
-                        error_msg = f"ASR服务初始化失败: {result.get('payload_msg', {}).get('error', '未知错误')}"
-                        logger.bind(tag=TAG).error(error_msg)
-                        raise Exception(error_msg)
+    async def receive_audio(self, conn: "ConnectionHandler", pcm_frame, audio_have_voice):
+        # 先调用父类方法处理基础逻辑（pre-roll 与 VAD 状态）
+        await super().receive_audio(conn, pcm_frame, audio_have_voice)
 
-                except Exception as e:
-                    logger.bind(tag=TAG).error(f"发送初始化请求失败: {str(e)}")
-                    if hasattr(e, "__cause__") and e.__cause__:
-                        logger.bind(tag=TAG).error(f"错误原因: {str(e.__cause__)}")
-                    raise e
-
-                # 启动接收ASR结果的异步任务
-                self.forward_task = asyncio.create_task(self._forward_asr_results(conn))
-
-                # 发送缓存的音频数据
-                if conn.asr_audio and len(conn.asr_audio) > 0:
-                    for cached_pcm in conn.asr_audio[-10:]:
-                        try:
-                            payload = gzip.compress(cached_pcm)
-                            audio_request = bytearray(
-                                self.generate_audio_default_header()
-                            )
-                            audio_request.extend(len(payload).to_bytes(4, "big"))
-                            audio_request.extend(payload)
-                            await self.asr_ws.send(audio_request)
-                        except Exception as e:
-                            logger.bind(tag=TAG).info(
-                                f"发送缓存音频数据时发生错误: {e}"
-                            )
-
-            except Exception as e:
-                logger.bind(tag=TAG).error(f"建立ASR连接失败: {str(e)}")
-                if hasattr(e, "__cause__") and e.__cause__:
-                    logger.bind(tag=TAG).error(f"错误原因: {str(e.__cause__)}")
-                if self.asr_ws:
-                    await self.asr_ws.close()
-                    self.asr_ws = None
-                self.is_processing = False
+        voice = audio_have_voice or conn.client_have_voice
+        if self.asr_ws is None:
+            self._start_warm_session(conn)
+            # 待命会话还在握手且已经开口：等它完成，之后一次性补发
+            if voice and self._warm_task is not None:
+                await self._warm_task
+            if self.asr_ws is None:
+                # 握手失败或处于退避期：音频留在 conn.asr_audio，下一帧再试
                 return
 
-        # 发送当前音频数据
-        if self.asr_ws and self.is_processing and not self._is_stopping:
-            try:
-                payload = gzip.compress(pcm_frame)
-                audio_request = bytearray(self.generate_audio_default_header())
-                audio_request.extend(len(payload).to_bytes(4, "big"))
-                audio_request.extend(payload)
-                await self.asr_ws.send(audio_request)
-            except Exception as e:
-                logger.bind(tag=TAG).info(f"发送音频数据时发生错误: {e}")
+        if not self.is_processing:
+            if not voice:
+                return
+            # 开始本次识别：把说话开始以来累积的全部音频（含握手期间的）一次送出
+            self.is_processing = True
+            for cached_pcm in list(conn.asr_audio):
+                await self._send_pcm(cached_pcm)
+            return
+
+        if not self._is_stopping:
+            await self._send_pcm(pcm_frame)
+
+    async def _send_pcm(self, pcm: bytes):
+        if self.asr_ws is None:
+            return
+        try:
+            payload = gzip.compress(pcm)
+            audio_request = bytearray(self.generate_audio_default_header())
+            audio_request.extend(len(payload).to_bytes(4, "big"))
+            audio_request.extend(payload)
+            await self.asr_ws.send(audio_request)
+        except Exception as e:
+            logger.bind(tag=TAG).info(f"发送音频数据时发生错误: {e}")
 
     async def _forward_asr_results(self, conn: "ConnectionHandler"):
         try:
@@ -256,6 +262,8 @@ class ASRProvider(ASRProviderBase):
             self._is_stopping = False
             # 重置所有音频相关状态
             conn.reset_audio_states()
+            # 本轮结束，后台预连下一轮，让下次开口不再等握手
+            self._start_warm_session(conn)
 
     def stop_ws_connection(self):
         if self.asr_ws:
@@ -417,6 +425,10 @@ class ASRProvider(ASRProviderBase):
 
     async def close(self):
         """资源清理方法"""
+        self._closed = True
+        if self._warm_task is not None:
+            self._warm_task.cancel()
+            self._warm_task = None
         if self.asr_ws:
             await self.asr_ws.close()
             self.asr_ws = None
